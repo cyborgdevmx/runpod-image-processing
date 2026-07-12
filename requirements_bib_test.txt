@@ -1,0 +1,6 @@
+# Dependencias para prueba de detección de dorsales
+paddleocr
+paddlepaddle-gpu  # Usar paddlepaddle si no tienes GPU
+opencv-python-headless
+numpy
+requests
