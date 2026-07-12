@@ -95,7 +95,7 @@ class Config:
     REQUEST_TIMEOUT       15    HTTP download timeout in seconds
     GPU_CTX                0    CUDA device index (0=GPU, -1=CPU fallback)
     FACE_MODEL      buffalo_l   InsightFace model name
-    MIN_BIB_CONFIDENCE  0.5     Minimum OCR confidence to accept a bib detection
+    MIN_BIB_CONFIDENCE  0.3     Minimum OCR confidence to accept a bib detection
     MAX_BIB_DIGITS        5     Maximum digits accepted as a valid bib number
     """
     max_download_workers: int
@@ -114,7 +114,7 @@ class Config:
             request_timeout=int(os.getenv("REQUEST_TIMEOUT", "15")),
             gpu_ctx=int(os.getenv("GPU_CTX", "0")),
             face_model=os.getenv("FACE_MODEL", "buffalo_l"),
-            min_bib_confidence=float(os.getenv("MIN_BIB_CONFIDENCE", "0.5")),
+            min_bib_confidence=float(os.getenv("MIN_BIB_CONFIDENCE", "0.3")),
             max_bib_digits=int(os.getenv("MAX_BIB_DIGITS", "5")),
         )
 
@@ -330,6 +330,18 @@ class BibDetector:
         Returns [] if none found or on error. Never raises.
         """
         try:
+            # Upscale small images so distant/small bib numbers stay legible to
+            # the text detector. Indexing often passes a downscaled thumbnail
+            # (~600px), at which a small bib becomes unreadable. Bring the long
+            # side up to ~1500px before OCR, then remap bboxes back.
+            h, w = image.shape[:2]
+            long_side = max(h, w)
+            scale = 1.0
+            if long_side < 1500:
+                scale = 1500 / long_side
+                image = cv2.resize(image, (int(w * scale), int(h * scale)),
+                                    interpolation=cv2.INTER_CUBIC)
+
             raw = self._ocr.ocr(image, cls=True)
             if not raw or not raw[0]:
                 return []
@@ -346,7 +358,7 @@ class BibDetector:
                     bibs.append(BibData(
                         number=digits,
                         confidence=float(confidence),
-                        bbox=[[int(p[0]), int(p[1])] for p in bbox],
+                        bbox=[[int(p[0] / scale), int(p[1] / scale)] for p in bbox],
                     ))
 
             bibs.sort(key=lambda b: b.confidence, reverse=True)
