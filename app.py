@@ -59,6 +59,7 @@ from __future__ import annotations
 import base64
 import logging
 import os
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any
@@ -203,9 +204,15 @@ class ImageLoader:
     # if a URL accidentally points to a video or other large file.
     _MAX_IMAGE_BYTES = 20 * 1024 * 1024  # 20 MB
 
+    # Presigned R2 URLs are valid for the job's lifetime, so a transient
+    # network blip or a momentary 5xx from storage is worth retrying rather
+    # than silently dropping the photo for the whole batch.
+    _MAX_DOWNLOAD_ATTEMPTS = 3
+    _RETRY_BASE_DELAY_SECONDS = 0.5
+
     def from_url(self, url: str) -> np.ndarray | None:
         """
-        Download and decode image from URL.
+        Download and decode image from URL, retrying on transient failures.
         Returns None on any failure — never raises.
 
         Timeout is a (connect, read) tuple:
@@ -214,25 +221,45 @@ class ImageLoader:
         Response is capped at _MAX_IMAGE_BYTES to prevent memory exhaustion
         from unexpectedly large files (videos, etc.).
         """
-        try:
-            resp = requests.get(url, timeout=(5, self._timeout))
-            resp.raise_for_status()
+        last_exc: Exception | None = None
+        for attempt in range(1, self._MAX_DOWNLOAD_ATTEMPTS + 1):
+            try:
+                resp = requests.get(url, timeout=(5, self._timeout))
+                resp.raise_for_status()
 
-            if len(resp.content) > self._MAX_IMAGE_BYTES:
+                if len(resp.content) > self._MAX_IMAGE_BYTES:
+                    logger.warning(
+                        "Skipping oversized response (%d bytes) for url=%s",
+                        len(resp.content), url,
+                    )
+                    return None
+
+                arr = np.frombuffer(resp.content, np.uint8)
+                img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+                if img is None:
+                    logger.warning("cv2.imdecode returned None for url=%s", url)
+                return img
+            except requests.exceptions.HTTPError as exc:
+                status = exc.response.status_code if exc.response is not None else None
+                # 4xx other than 429 (expired/invalid presigned URL, not found) won't
+                # succeed on retry — fail fast instead of wasting attempts.
+                if status is not None and status != 429 and status < 500:
+                    logger.warning("Download failed (non-retryable) url=%s: %s", url, exc)
+                    return None
+                last_exc = exc
+            except Exception as exc:
+                last_exc = exc
+
+            if attempt < self._MAX_DOWNLOAD_ATTEMPTS:
+                delay = self._RETRY_BASE_DELAY_SECONDS * attempt
                 logger.warning(
-                    "Skipping oversized response (%d bytes) for url=%s",
-                    len(resp.content), url,
+                    "Download attempt %d/%d failed url=%s: %s — retrying in %.1fs",
+                    attempt, self._MAX_DOWNLOAD_ATTEMPTS, url, last_exc, delay,
                 )
-                return None
+                time.sleep(delay)
 
-            arr = np.frombuffer(resp.content, np.uint8)
-            img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-            if img is None:
-                logger.warning("cv2.imdecode returned None for url=%s", url)
-            return img
-        except Exception as exc:
-            logger.warning("Download failed url=%s: %s", url, exc)
-            return None
+        logger.warning("Download failed after %d attempts url=%s: %s", self._MAX_DOWNLOAD_ATTEMPTS, url, last_exc)
+        return None
 
     def from_base64(self, b64: str) -> np.ndarray | None:
         """
