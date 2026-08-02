@@ -98,6 +98,8 @@ class Config:
     FACE_MODEL      buffalo_l   InsightFace model name
     MIN_BIB_CONFIDENCE  0.3     Minimum OCR confidence to accept a bib detection
     MAX_BIB_DIGITS        5     Maximum digits accepted as a valid bib number
+    BIB_ANGLE_CLS      false    Run PaddleOCR's 180-degree angle classifier
+    REQUIRE_GPU        false    Abort instead of falling back to CPU inference
     """
     max_download_workers: int
     max_batch_size: int
@@ -106,6 +108,8 @@ class Config:
     face_model: str
     min_bib_confidence: float
     max_bib_digits: int
+    bib_angle_cls: bool
+    require_gpu: bool
 
     @classmethod
     def from_env(cls) -> Config:
@@ -117,6 +121,8 @@ class Config:
             face_model=os.getenv("FACE_MODEL", "buffalo_l"),
             min_bib_confidence=float(os.getenv("MIN_BIB_CONFIDENCE", "0.3")),
             max_bib_digits=int(os.getenv("MAX_BIB_DIGITS", "5")),
+            bib_angle_cls=os.getenv("BIB_ANGLE_CLS", "false").lower() == "true",
+            require_gpu=os.getenv("REQUIRE_GPU", "false").lower() == "true",
         )
 
 
@@ -325,29 +331,48 @@ class BibDetector:
     confidence >= MIN_BIB_CONFIDENCE.
     """
 
+    # Set True on the class once a GPU probe has fallen back, so the condition
+    # is visible on every batch rather than only in the startup log lines of one
+    # worker (which is easy to miss in the RunPod console).
+    on_cpu: bool = False
+
     def __init__(self, config: Config) -> None:
         self._min_confidence = config.min_bib_confidence
         self._max_digits = config.max_bib_digits
+        self._require_gpu = config.require_gpu
+        self._angle_cls = config.bib_angle_cls
         use_gpu = config.gpu_ctx >= 0
         logger.info("Loading PaddleOCR gpu=%s ...", use_gpu)
         self._ocr = PaddleOCR(use_angle_cls=True, lang="en", use_gpu=use_gpu, show_log=False)
         if use_gpu:
             self._ocr = self._probe_or_fallback(self._ocr)
-        logger.info("PaddleOCR ready")
+        logger.info("PaddleOCR ready (device=%s)", "cpu" if BibDetector.on_cpu else "gpu")
 
     def _probe_or_fallback(self, ocr: PaddleOCR) -> PaddleOCR:
         """
         Run a single tiny inference to verify cuDNN loads correctly.
-        Falls back to CPU once at startup rather than failing per-image at runtime.
-        This catches CUDA 11.8 / cuDNN ABI mismatches (e.g. wrong paddlepaddle-gpu build).
+        Catches CUDA 11.8 / cuDNN ABI mismatches (e.g. wrong paddlepaddle-gpu build).
+
+        A silent CPU fallback is the most expensive failure mode this worker has:
+        the endpoint keeps billing GPU rates while PaddleOCR runs 10-30x slower,
+        which in turn pushes queued batches past the caller's staleness threshold.
+        It used to log at WARNING and carry on. Now it is an ERROR, it is
+        repeated on every batch, and REQUIRE_GPU=true makes it fatal so the
+        worker dies instead of quietly burning money.
         """
         try:
             ocr.ocr(np.zeros((32, 32, 3), dtype=np.uint8), cls=False)
             return ocr
         except Exception as exc:
-            logger.warning(
-                "PaddleOCR GPU probe failed (%s) — switching to CPU for this session", exc
+            if self._require_gpu:
+                logger.error("PaddleOCR GPU probe failed (%s) and REQUIRE_GPU is set — aborting", exc)
+                raise
+            logger.error(
+                "PaddleOCR GPU probe FAILED (%s) — falling back to CPU. Bib OCR will be "
+                "10-30x slower at unchanged GPU cost. Fix the paddlepaddle-gpu / cuDNN "
+                "build, or set REQUIRE_GPU=true to fail fast instead.", exc
             )
+            BibDetector.on_cpu = True
             return PaddleOCR(use_angle_cls=True, lang="en", use_gpu=False, show_log=False)
 
     def process(self, image: np.ndarray) -> list[BibData]:
@@ -369,7 +394,12 @@ class BibDetector:
                 image = cv2.resize(image, (int(w * scale), int(h * scale)),
                                     interpolation=cv2.INTER_CUBIC)
 
-            raw = self._ocr.ocr(image, cls=True)
+            # cls=True runs PaddleOCR's 180-degree angle classifier on every
+            # detected text box — roughly a quarter of OCR time. Race bibs are
+            # worn upright and are never upside down in practice, so it is spend
+            # with no recall benefit. Re-enable with BIB_ANGLE_CLS=true if a
+            # specific event proves otherwise.
+            raw = self._ocr.ocr(image, cls=self._angle_cls)
             if not raw or not raw[0]:
                 return []
 
@@ -513,6 +543,12 @@ class RequestHandler:
 
         if len(images) == 0:
             return {"results": []}
+
+        if mode in ("bib", "both") and BibDetector.on_cpu:
+            logger.error(
+                "Bib OCR is running on CPU for this batch of %d — GPU billing, CPU speed. "
+                "See the PaddleOCR GPU probe error in this worker's startup logs.", len(images)
+            )
 
         logger.info("Batch request: %d images, mode=%s", len(images), mode)
         results = self._batch.process(images, mode)
