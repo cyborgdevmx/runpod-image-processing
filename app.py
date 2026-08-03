@@ -59,6 +59,7 @@ from __future__ import annotations
 import base64
 import logging
 import os
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -97,6 +98,7 @@ class Config:
     GPU_CTX                0    CUDA device index (0=GPU, -1=CPU fallback)
     FACE_MODEL      buffalo_l   InsightFace model name
     MIN_BIB_CONFIDENCE  0.3     Minimum OCR confidence to accept a bib detection
+    MIN_BIB_DIGITS        2     Minimum digits accepted as a valid bib number
     MAX_BIB_DIGITS        5     Maximum digits accepted as a valid bib number
     BIB_ANGLE_CLS      false    Run PaddleOCR's 180-degree angle classifier
     REQUIRE_GPU        false    Abort instead of falling back to CPU inference
@@ -107,6 +109,7 @@ class Config:
     gpu_ctx: int
     face_model: str
     min_bib_confidence: float
+    min_bib_digits: int
     max_bib_digits: int
     bib_angle_cls: bool
     require_gpu: bool
@@ -120,6 +123,7 @@ class Config:
             gpu_ctx=int(os.getenv("GPU_CTX", "0")),
             face_model=os.getenv("FACE_MODEL", "buffalo_l"),
             min_bib_confidence=float(os.getenv("MIN_BIB_CONFIDENCE", "0.3")),
+            min_bib_digits=int(os.getenv("MIN_BIB_DIGITS", "2")),
             max_bib_digits=int(os.getenv("MAX_BIB_DIGITS", "5")),
             bib_angle_cls=os.getenv("BIB_ANGLE_CLS", "false").lower() == "true",
             require_gpu=os.getenv("REQUIRE_GPU", "false").lower() == "true",
@@ -338,6 +342,7 @@ class BibDetector:
 
     def __init__(self, config: Config) -> None:
         self._min_confidence = config.min_bib_confidence
+        self._min_digits = config.min_bib_digits
         self._max_digits = config.max_bib_digits
         self._require_gpu = config.require_gpu
         self._angle_cls = config.bib_angle_cls
@@ -375,10 +380,52 @@ class BibDetector:
             BibDetector.on_cpu = True
             return PaddleOCR(use_angle_cls=True, lang="en", use_gpu=False, show_log=False)
 
+    # Letter shapes that bib fonts render almost identically to a digit.
+    # Applied only to tokens that are already mostly numeric (see
+    # _extract_numbers), so a word like "PIRMA" is never turned into a number.
+    _LOOKALIKES = str.maketrans({
+        "O": "0", "o": "0", "Q": "0", "D": "0",
+        "I": "1", "l": "1", "|": "1",
+        "S": "5", "B": "8", "Z": "2", "G": "6",
+    })
+
+    # "21K", "10K", "5K" — the distance printed on the bib, not a competitor.
+    _DISTANCE_LABEL = re.compile(r"^\d{1,3}[Kk]$")
+
+    def _extract_numbers(self, text: str) -> list[str]:
+        """
+        Pull plausible bib numbers out of a single OCR text box.
+
+        The previous implementation concatenated every digit in the box:
+        "PIRMA 21K 1212" collapsed to "211212", which exceeded MAX_BIB_DIGITS
+        and silently discarded the whole detection. Race bibs routinely carry
+        printed event branding above the number, so that path threw away the
+        common case — and when OCR happened to split the box instead, it stored
+        the "21" from "21K" as if it were a competitor.
+
+        It also dropped leading zeros: str.isdigit filtering deleted the letter
+        the OCR saw in place of a "0", turning bib 0515 into 515.
+        """
+        numbers: list[str] = []
+        for token in re.split(r"[\s,;:/\\_·•-]+", text):
+            if not token:
+                continue
+            digit_count = sum(c.isdigit() for c in token)
+            if digit_count == 0:
+                continue
+            if self._DISTANCE_LABEL.match(token):
+                continue
+            # Repair lookalikes only when at most two characters are non-digit,
+            # so "0515" misread as "O515" is fixed but "SOS" stays a word.
+            if digit_count >= len(token) - 2:
+                token = token.translate(self._LOOKALIKES)
+            numbers.extend(re.findall(r"\d+", token))
+        return numbers
+
     def process(self, image: np.ndarray) -> list[BibData]:
         """
         Detect bib numbers in image.
-        Returns list sorted by confidence (highest first).
+        Returns list sorted by confidence (highest first), deduplicated.
         Returns [] if none found or on error. Never raises.
         """
         try:
@@ -404,14 +451,20 @@ class BibDetector:
                 return []
 
             bibs: list[BibData] = []
+            seen: set[str] = set()
             for detection in raw[0]:
                 bbox, (text, confidence) = detection
-                digits = "".join(filter(str.isdigit, text))
-                if (
-                    digits
-                    and confidence >= self._min_confidence
-                    and 1 <= len(digits) <= self._max_digits
-                ):
+                if confidence < self._min_confidence:
+                    continue
+                for digits in self._extract_numbers(text):
+                    if not self._min_digits <= len(digits) <= self._max_digits:
+                        continue
+                    # One printed string is often detected in several
+                    # overlapping boxes. Without this, a single photo could
+                    # store the same number a dozen times.
+                    if digits in seen:
+                        continue
+                    seen.add(digits)
                     bibs.append(BibData(
                         number=digits,
                         confidence=float(confidence),
